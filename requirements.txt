@@ -1,0 +1,18 @@
+# Deliberately Vulnerable Dependencies for Security Testing
+# WARNING: These versions contain known vulnerabilities!
+
+# Core Flask dependencies - these versions work with Python 3.10+
+Flask==2.3.0
+Werkzeug==2.3.0
+Jinja2==3.1.2
+MarkupSafe==2.1.1
+
+# Additional vulnerable packages (optional for SCA scanning)
+# Using versions that actually build on Python 3.10+
+requests==2.25.0
+urllib3==1.26.4
+PyYAML==6.0
+cryptography==39.0.0
+
+# Note: These versions will still trigger SCA scanner alerts
+# PyYAML 6.0 has known CVEs but builds successfully on Python 3.10+

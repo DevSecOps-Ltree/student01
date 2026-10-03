@@ -1,0 +1,8 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.log
+zap-report*
+sbom*
+.DS_Store

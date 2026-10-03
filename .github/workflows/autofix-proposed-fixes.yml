@@ -1,0 +1,505 @@
+name: Autofix after pipeline
+
+on:
+  workflow_run:
+    workflows:
+      - "Python Security Scan (Bandit + Safety)"
+      - "DAST - OWASP ZAP Scan"
+      - "DAST - OWASP ZAP Active Scan"
+      - "CodeQL Analysis (SAST)"
+    types: [completed]
+
+permissions:
+  # Read workflow runs to gate properly
+  actions: read
+  # Read code scanning alerts
+  security-events: read
+  # Push branch + create PR
+  contents: write
+  pull-requests: write
+  # Access GitHub Models API
+  models: read
+
+concurrency:
+  group: autofix-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  gate-and-autofix:
+    # Only act on default branch completions
+    if: ${{ github.event.workflow_run.head_branch == github.event.repository.default_branch }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Gate on all workflows succeeding for this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          REQUIRED=(
+            "Python Security Scan (Bandit + Safety)"
+            "DAST - OWASP ZAP Scan"
+            "DAST - OWASP ZAP Active Scan"
+            "CodeQL Analysis (SAST)"
+          )
+
+          echo "Checking required workflow runs for SHA: $SHA"
+
+          RUNS_JSON="$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/$REPO/actions/runs?per_page=100&head_sha=$SHA")"
+
+          missing=0
+          failed=0
+
+          for wf in "${REQUIRED[@]}"; do
+            conc="$(echo "$RUNS_JSON" | jq -r --arg WF "$wf" '
+              .workflow_runs
+              | map(select(.name == $WF))
+              | sort_by(.run_number)
+              | last
+              | .conclusion // empty
+            ')"
+
+            if [ -z "$conc" ]; then
+              echo "❗ Missing run for: $wf"
+              missing=1
+            else
+              echo "• $wf -> $conc"
+              if [ "$conc" != "success" ]; then
+                failed=1
+              fi
+            fi
+          done
+
+          # If not all present yet, no-op (this will run again when others complete)
+          if [ "$missing" -eq 1 ]; then
+            echo "Not all required workflows have completed yet. Exiting."
+            exit 0
+          fi
+
+          # If any failed/cancelled/timed_out, do not autofix
+          if [ "$failed" -eq 1 ]; then
+            echo "At least one required workflow did not succeed. Not running autofix."
+            exit 0
+          fi
+
+          echo "✅ All required workflows succeeded. Proceeding to autofix."
+
+      - name: Checkout default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Create/update proposed-fixes branch baseline
+        run: |
+          set -euo pipefail
+          git fetch origin
+          git checkout -B proposed-fixes origin/${{ github.event.repository.default_branch }}
+          git config user.name "autofix-bot"
+          git config user.email "autofix-bot@users.noreply.github.com"
+          # Force-push the baseline to remote NOW, before Copilot commits.
+          # This ensures Copilot's API commits land on a branch based on current main,
+          # the same starting point as our local branch — preventing add/add conflicts
+          # caused by stale origin/proposed-fixes history from previous runs.
+          git push --force origin proposed-fixes
+
+      - name: Generate + commit Copilot Autofix for open code scanning alerts
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Create debug log directory
+          mkdir -p autofix-debug-logs
+
+          # List open code scanning alerts (CodeQL lives here)
+          echo "=== API Call: GET /repos/$REPO/code-scanning/alerts ===" | tee -a autofix-debug-logs/api-calls.log
+          alerts="$(timeout 30s curl -s -w "\nHTTP_CODE:%{http_code}\n" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/code-scanning/alerts?state=open&per_page=100" \
+            2>&1 | tee autofix-debug-logs/01-list-alerts-response.txt || echo "[]")"
+
+          # Extract just the JSON body (before HTTP_CODE line)
+          alerts_json="$(echo "$alerts" | sed '/^HTTP_CODE:/Q')"
+          http_code="$(echo "$alerts" | grep "^HTTP_CODE:" | cut -d: -f2)"
+          echo "Response HTTP code: $http_code" | tee -a autofix-debug-logs/api-calls.log
+
+          # Filter to high-value alerts only (error/warning severity)
+          # Sort by number (ascending) to prioritize lower-numbered alerts first
+          # Process until we get 3 successful fixes (or hit max 15 attempts to avoid rate limiting)
+          nums="$(echo "$alerts_json" | jq -r '.[] | select(.rule.severity=="error" or .rule.severity=="warning") | .number' 2>/dev/null | sort -n || echo "")"
+
+          if [ -z "$nums" ]; then
+            echo "⚠️  No high-severity code scanning alerts found (error/warning level)." | tee -a autofix-debug-logs/api-calls.log
+            echo "Copilot Autofix focuses on actionable security findings." | tee -a autofix-debug-logs/api-calls.log
+            echo "Full response saved to autofix-debug-logs/01-list-alerts-response.txt"
+            exit 0
+          fi
+
+          total_alerts="$(echo "$alerts_json" | jq -r '.[].number' 2>/dev/null | wc -l)"
+          echo "Found $total_alerts total alert(s), will process until 3 successful fixes or max 15 attempts" | tee -a autofix-debug-logs/api-calls.log
+
+          successful_fixes=0
+          attempts=0
+
+          for n in $nums; do
+            attempts=$((attempts + 1))
+
+            # Stop if we have 3 successful fixes or tried 15 alerts (rate limit safety)
+            if [ "$successful_fixes" -ge 3 ] || [ "$attempts" -gt 15 ]; then
+              echo "Stopping: $successful_fixes successful fixes after $attempts attempts" | tee -a autofix-debug-logs/api-calls.log
+              break
+            fi
+            echo "" | tee -a autofix-debug-logs/api-calls.log
+            echo "=== Processing Alert #$n ===" | tee -a autofix-debug-logs/api-calls.log
+
+            # Step 1: Check if autofix already exists (avoids unnecessary POSTs)
+            echo "API Call: GET /repos/$REPO/code-scanning/alerts/$n/autofix (check existing)" | tee -a autofix-debug-logs/api-calls.log
+            timeout 10s curl -v \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$REPO/code-scanning/alerts/$n/autofix" \
+              > autofix-debug-logs/02-alert-${n}-check-existing.txt 2>&1
+
+            # Read from file to preserve newlines (tr -d removes curl's \r line endings)
+            existing_http_code="$(grep "< HTTP" autofix-debug-logs/02-alert-${n}-check-existing.txt | tr -d '\r' | tail -1 | awk '{print $NF}')"
+            # Extract JSON body (everything after "Connection...left intact" line)
+            existing_body="$(awk '/Connection.*left intact/{flag=1; next} flag' autofix-debug-logs/02-alert-${n}-check-existing.txt)"
+            existing_status="$(echo "$existing_body" | jq -r '.status // empty' 2>/dev/null || echo "")"
+
+            echo "Existing fix check: HTTP $existing_http_code, status=$existing_status" | tee -a autofix-debug-logs/api-calls.log
+
+            # If 200 and status is success, go straight to commit
+            if [ "$existing_http_code" = "200" ] && [ "$existing_status" = "success" ]; then
+              echo "✅ Autofix already exists for alert #$n, proceeding to commit" | tee -a autofix-debug-logs/api-calls.log
+              status="complete"
+            # If 404 with "No suggested fix found", this alert isn't supported - skip it
+            elif [ "$existing_http_code" = "404" ]; then
+              if grep -q "No suggested fix found" autofix-debug-logs/02-alert-${n}-check-existing.txt; then
+                echo "ℹ️  No Copilot Autofix available for alert #$n - trying GitHub Models API fallback..." | tee -a autofix-debug-logs/api-calls.log
+
+                # Get full alert details
+                echo "API Call: GET /repos/$REPO/code-scanning/alerts/$n" | tee -a autofix-debug-logs/api-calls.log
+                timeout 30s curl -s \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/code-scanning/alerts/$n" \
+                  > autofix-debug-logs/alert-${n}-details.json 2>&1
+
+                # Extract alert information
+                alert_rule="$(jq -r '.rule.id // "unknown"' autofix-debug-logs/alert-${n}-details.json)"
+                alert_desc="$(jq -r '.rule.description // "unknown"' autofix-debug-logs/alert-${n}-details.json)"
+                alert_severity="$(jq -r '.rule.severity // "unknown"' autofix-debug-logs/alert-${n}-details.json)"
+                alert_message="$(jq -r '.most_recent_instance.message.text // "unknown"' autofix-debug-logs/alert-${n}-details.json)"
+                file_path="$(jq -r '.most_recent_instance.location.path // ""' autofix-debug-logs/alert-${n}-details.json)"
+                start_line="$(jq -r '.most_recent_instance.location.start_line // 0' autofix-debug-logs/alert-${n}-details.json)"
+                end_line="$(jq -r '.most_recent_instance.location.end_line // 0' autofix-debug-logs/alert-${n}-details.json)"
+
+                echo "  Rule: $alert_rule ($alert_severity)" | tee -a autofix-debug-logs/api-calls.log
+                echo "  File: $file_path:$start_line-$end_line" | tee -a autofix-debug-logs/api-calls.log
+
+                if [ -z "$file_path" ] || [ "$start_line" = "0" ]; then
+                  echo "  ⚠️  Could not extract location info, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  continue
+                fi
+
+                # Read the ENTIRE file (better for AI to understand context)
+                full_file_content="$(cat "$file_path" 2>/dev/null || echo "")"
+
+                if [ -z "$full_file_content" ]; then
+                  echo "  ⚠️  Could not read file $file_path, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  continue
+                fi
+
+                # Call GitHub Models API - ask for COMPLETE fixed file
+                echo "  Calling GitHub Models API (gpt-4o) for full file fix..." | tee -a autofix-debug-logs/api-calls.log
+
+                timeout 60s curl -s -X POST \
+                  "https://models.inference.ai.azure.com/chat/completions" \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d "$(jq -n \
+                    --arg rule "$alert_rule" \
+                    --arg severity "$alert_severity" \
+                    --arg desc "$alert_desc" \
+                    --arg msg "$alert_message" \
+                    --arg path "$file_path" \
+                    --arg start "$start_line" \
+                    --arg end "$end_line" \
+                    --arg fullcode "$full_file_content" \
+                    '{
+                      "model": "gpt-4o",
+                      "messages": [{
+                        "role": "user",
+                        "content": ("You are a security expert. Fix this vulnerability and return the COMPLETE fixed file.\n\n" +
+                          "VULNERABILITY:\n" +
+                          "- Rule: \($rule) (\($severity))\n" +
+                          "- Description: \($desc)\n" +
+                          "- Issue: \($msg)\n" +
+                          "- Location: lines \($start)-\($end)\n\n" +
+                          "CURRENT FILE (\($path)):\n" +
+                          "```python\n" + $fullcode + "\n```\n\n" +
+                          "INSTRUCTIONS:\n" +
+                          "1. Fix ONLY the security vulnerability at lines \($start)-\($end)\n" +
+                          "2. Keep all other code exactly as-is\n" +
+                          "3. Return the COMPLETE fixed file\n" +
+                          "4. Use ONLY this format - NO explanations:\n" +
+                          "```python\n[complete fixed code here]\n```")
+                      }],
+                      "temperature": 0.2,
+                      "max_tokens": 4000
+                    }')" \
+                  > autofix-debug-logs/alert-${n}-ai-response.json 2>&1
+
+                ai_response_code=$?
+                if [ $ai_response_code -ne 0 ]; then
+                  echo "  ⚠️  GitHub Models API call failed, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  continue
+                fi
+
+                # Extract fixed code from response and strip markdown
+                raw_response="$(jq -r '.choices[0].message.content // ""' autofix-debug-logs/alert-${n}-ai-response.json)"
+
+                if [ -z "$raw_response" ]; then
+                  echo "  ⚠️  No fix generated by AI, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  continue
+                fi
+
+                # Strip markdown code fences and extract Python code
+                fixed_code="$(echo "$raw_response" | sed -n '/```python/,/```/p' | sed '1d;$d')"
+
+                # If no code fence, try the whole response
+                if [ -z "$fixed_code" ]; then
+                  fixed_code="$raw_response"
+                fi
+
+                # Save the fixed code to temp file
+                echo "$fixed_code" > "${file_path}.fixed"
+
+                # Validate Python syntax
+                if ! python3 -m py_compile "${file_path}.fixed" 2>/dev/null; then
+                  echo "  ⚠️  AI-generated code has syntax errors, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  rm "${file_path}.fixed"
+                  continue
+                fi
+
+                echo "  ✅ AI generated valid fix, applying to $file_path" | tee -a autofix-debug-logs/api-calls.log
+
+                # Create a backup and apply
+                cp "$file_path" "${file_path}.backup"
+                mv "${file_path}.fixed" "$file_path"
+
+                # Commit the fix
+                git add "$file_path"
+                if git diff --cached --quiet; then
+                  echo "  ⚠️  No changes to commit (AI fix identical to original?), skipping" | tee -a autofix-debug-logs/api-calls.log
+                  git restore "$file_path"
+                  rm "${file_path}.backup"
+                  continue
+                fi
+
+                git commit -m "AI-generated fix for code scanning alert no. $n
+
+                Rule: $alert_rule
+                Severity: $alert_severity
+
+                Generated by GitHub Models (gpt-4o) via automated workflow.
+
+                Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>" || {
+                  echo "  ⚠️  Commit failed, skipping" | tee -a autofix-debug-logs/api-calls.log
+                  git restore "$file_path"
+                  rm "${file_path}.backup"
+                  continue
+                }
+
+                rm "${file_path}.backup"
+                echo "  ✅ Successfully committed AI-generated fix for alert #$n" | tee -a autofix-debug-logs/api-calls.log
+                successful_fixes=$((successful_fixes + 1))
+                continue  # AI fix applied — skip requesting Copilot autofix for same alert
+              fi
+
+              # AI fallback didn't apply (or wasn't triggered) — try requesting Copilot autofix
+              echo "Requesting new autofix for alert #$n..." | tee -a autofix-debug-logs/api-calls.log
+
+              # Step 2: Request autofix generation
+              echo "API Call: POST /repos/$REPO/code-scanning/alerts/$n/autofix" | tee -a autofix-debug-logs/api-calls.log
+              timeout 30s curl -v -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/code-scanning/alerts/$n/autofix" \
+                > autofix-debug-logs/03-alert-${n}-autofix-request.txt 2>&1 || echo "FAILED" > autofix-debug-logs/03-alert-${n}-autofix-request.txt
+
+              autofix_http_code="$(grep "< HTTP" autofix-debug-logs/03-alert-${n}-autofix-request.txt | tr -d '\r' | tail -1 | awk '{print $NF}')"
+              echo "Autofix request HTTP code: $autofix_http_code" | tee -a autofix-debug-logs/api-calls.log
+
+              # Handle rate limiting (403 with rate limit message)
+              if [ "$autofix_http_code" = "403" ]; then
+                if grep -q "rate limit exceeded" autofix-debug-logs/03-alert-${n}-autofix-request.txt; then
+                  rate_reset="$(grep -i "x-ratelimit-reset:" autofix-debug-logs/03-alert-${n}-autofix-request.txt | awk '{print $NF}' | tr -d '\r')"
+                  if [ -n "$rate_reset" ]; then
+                    now="$(date +%s)"
+                    sleep_time=$((rate_reset - now + 2))
+                    if [ "$sleep_time" -gt 0 ] && [ "$sleep_time" -lt 300 ]; then
+                      echo "⏳ Rate limited, sleeping ${sleep_time}s until reset..." | tee -a autofix-debug-logs/api-calls.log
+                      sleep "$sleep_time"
+                      # Retry once after rate limit
+                      echo "Retrying after rate limit..." | tee -a autofix-debug-logs/api-calls.log
+                      timeout 30s curl -v -X POST \
+                        -H "Authorization: Bearer $GH_TOKEN" \
+                        -H "X-GitHub-Api-Version: 2022-11-28" \
+                        -H "Accept: application/vnd.github+json" \
+                        "https://api.github.com/repos/$REPO/code-scanning/alerts/$n/autofix" \
+                        >> autofix-debug-logs/03-alert-${n}-autofix-request.txt 2>&1 || echo "FAILED" >> autofix-debug-logs/03-alert-${n}-autofix-request.txt
+                      autofix_http_code="$(grep "< HTTP" autofix-debug-logs/03-alert-${n}-autofix-request.txt | tr -d '\r' | tail -1 | awk '{print $NF}')"
+                    fi
+                  fi
+                fi
+              fi
+
+              if grep -q "FAILED" autofix-debug-logs/03-alert-${n}-autofix-request.txt || [ "$autofix_http_code" != "200" ] && [ "$autofix_http_code" != "201" ]; then
+                echo "⚠️  Autofix request failed for alert #$n (HTTP $autofix_http_code)" | tee -a autofix-debug-logs/api-calls.log
+                continue
+              fi
+
+              # Step 3: Poll for completion (shorter window since we filtered to good alerts)
+              status="unknown"
+              for i in $(seq 1 12); do
+                echo "API Call: GET /repos/$REPO/code-scanning/alerts/$n/autofix (poll $i/12)" | tee -a autofix-debug-logs/api-calls.log
+                timeout 10s curl -v \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/code-scanning/alerts/$n/autofix" \
+                  > autofix-debug-logs/04-alert-${n}-status-poll-${i}.txt 2>&1 || echo "{\"status\":\"error\"}" > autofix-debug-logs/04-alert-${n}-status-poll-${i}.txt
+
+                status_http_code="$(grep "< HTTP" autofix-debug-logs/04-alert-${n}-status-poll-${i}.txt | tr -d '\r' | tail -1 | awk '{print $NF}' || echo "000")"
+                # Extract JSON body (everything after "Connection...left intact" line)
+                status_body="$(awk '/Connection.*left intact/{flag=1; next} flag' autofix-debug-logs/04-alert-${n}-status-poll-${i}.txt)"
+                status="$(echo "$status_body" | jq -r '.status // "error"' 2>/dev/null || echo "error")"
+
+                echo "  Poll $i/12: HTTP $status_http_code, status=$status" | tee -a autofix-debug-logs/api-calls.log
+
+                if [ "$status" = "success" ] || [ "$status" = "complete" ]; then
+                  echo "✅ Autofix complete for alert #$n" | tee -a autofix-debug-logs/api-calls.log
+                  status="complete"
+                  break
+                elif [ "$status" = "failed" ] || [ "$status" = "error" ]; then
+                  echo "❌ Autofix generation failed for alert #$n" | tee -a autofix-debug-logs/api-calls.log
+                  break
+                fi
+
+                sleep 10
+              done
+            else
+              echo "⚠️  Unexpected response checking existing fix: HTTP $existing_http_code" | tee -a autofix-debug-logs/api-calls.log
+              continue
+            fi
+
+            # Step 4: Commit autofix to proposed-fixes branch
+            if [ "$status" = "complete" ]; then
+              echo "API Call: POST /repos/$REPO/code-scanning/alerts/$n/autofix/commits" | tee -a autofix-debug-logs/api-calls.log
+              timeout 30s curl -v -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" \
+                -d "{\"target_ref\":\"proposed-fixes\"}" \
+                "https://api.github.com/repos/$REPO/code-scanning/alerts/$n/autofix/commits" \
+                > autofix-debug-logs/05-alert-${n}-commit.txt 2>&1 || echo "FAILED" > autofix-debug-logs/05-alert-${n}-commit.txt
+
+              commit_http_code="$(grep "< HTTP" autofix-debug-logs/05-alert-${n}-commit.txt | tr -d '\r' | tail -1 | awk '{print $NF}')"
+              echo "Commit HTTP code: $commit_http_code" | tee -a autofix-debug-logs/api-calls.log
+
+              if [ "$commit_http_code" = "200" ] || [ "$commit_http_code" = "201" ]; then
+                echo "✅ Successfully committed autofix for alert #$n to proposed-fixes branch" | tee -a autofix-debug-logs/api-calls.log
+                successful_fixes=$((successful_fixes + 1))
+              else
+                echo "⚠️  Failed to commit autofix for alert #$n (HTTP $commit_http_code)" | tee -a autofix-debug-logs/api-calls.log
+              fi
+            fi
+          done
+
+          echo "" | tee -a autofix-debug-logs/api-calls.log
+          echo "📊 Summary: $successful_fixes successful fixes out of $attempts alerts processed" | tee -a autofix-debug-logs/api-calls.log
+
+          echo "" | tee -a autofix-debug-logs/api-calls.log
+          echo "✅ Autofix processing complete" | tee -a autofix-debug-logs/api-calls.log
+          echo "" | tee -a autofix-debug-logs/api-calls.log
+          echo "Debug logs saved in autofix-debug-logs/ directory" | tee -a autofix-debug-logs/api-calls.log
+
+      - name: Upload Autofix Debug Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autofix-debug-logs
+          path: autofix-debug-logs/
+          if-no-files-found: warn
+
+      # Push AI-generated commits (Copilot API commits are already on remote)
+      - name: Push proposed-fixes branch
+        run: |
+          set -euo pipefail
+          # Fetch to get Copilot's commits (committed directly to origin/proposed-fixes
+          # by the API while the AI fallback was running locally).
+          git fetch origin
+
+          # Both Copilot and AI started from the same base (we force-pushed the baseline
+          # in the previous step), so this rebase should be conflict-free: Copilot fixed
+          # some alerts, AI fixed others, they touch different parts of the code.
+          if git log "origin/proposed-fixes..proposed-fixes" --oneline 2>/dev/null | grep -q .; then
+            echo "Rebasing local AI fixes on top of Copilot's commits..."
+            if git rebase origin/proposed-fixes; then
+              git push origin proposed-fixes
+            else
+              git rebase --abort
+              echo "⚠️ Unexpected rebase conflict — Copilot's fixes are already on remote."
+              echo "PR will be created from Copilot's commits."
+            fi
+          else
+            echo "No local AI commits to push (Copilot handled all fixes, or no fixes generated)"
+          fi
+
+      - name: Create or update PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # Check if there are any differences between branches
+          comparison="$(gh api "/repos/$REPO/compare/$BASE...proposed-fixes" --jq '.ahead_by')"
+
+          if [ "$comparison" -eq 0 ]; then
+            echo "⚠️  No commits on proposed-fixes branch (Copilot Autofix may be unavailable)"
+            echo "Skipping PR creation - no changes to propose"
+            exit 0
+          fi
+
+          echo "Found $comparison commit(s) to propose"
+
+          pr_url="$(gh pr list --repo "$REPO" --head proposed-fixes --base "$BASE" --json url --jq '.[0].url' || true)"
+
+          if [ -z "$pr_url" ]; then
+            echo "Creating new PR..."
+            gh pr create --repo "$REPO" \
+              --head proposed-fixes --base "$BASE" \
+              --title "Proposed fixes (Copilot Autofix)" \
+              --body "Automated PR containing Copilot Autofix commits for current CodeQL/code-scanning alerts."
+          else
+            echo "Updating existing PR: $pr_url"
+            gh pr edit "$pr_url" \
+              --title "Proposed fixes (Copilot Autofix)" \
+              --body "Updated automated PR with Copilot Autofix commits for current CodeQL/code-scanning alerts."
+          fi

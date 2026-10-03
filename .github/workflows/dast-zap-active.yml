@@ -1,0 +1,81 @@
+name: "DAST - OWASP ZAP Active Scan"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  zap-active-scan:
+    name: OWASP ZAP Active Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Flask dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Start Flask application
+      run: |
+        python app.py &
+        echo $! > flask.pid
+        sleep 5
+        curl -f http://localhost:5000/ || (echo "Flask failed to start" && exit 1)
+
+    - name: ZAP Full Active Scan
+      continue-on-error: true
+      uses: zaproxy/action-full-scan@v0.12.0
+      with:
+        target: 'http://127.0.0.1:5000'
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: >
+          -r zap_active_report.html
+          -J zap_active_report.json
+          -x zap_active_report.xml
+          -w zap_active_report.md
+
+    - name: Stop Flask application
+      if: always()
+      run: |
+        if [ -f flask.pid ]; then
+          kill $(cat flask.pid) || true
+        fi
+
+    - name: Upload ZAP Active Scan Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-active-scan-reports
+        path: |
+          zap_active_report.html
+          zap_active_report.json
+          zap_active_report.xml
+          zap_active_report.md
+        if-no-files-found: warn
+
+    - name: Generate Active Scan Summary
+      if: always()
+      run: |
+        echo "## 🔴 OWASP ZAP Active Scan Complete" >> $GITHUB_STEP_SUMMARY
+        echo "**⚠️ Active scan actively attacks the application to find vulnerabilities**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Target: http://127.0.0.1:5000" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f zap_active_report.md ]; then
+          echo "### Scan Results:" >> $GITHUB_STEP_SUMMARY
+          head -100 zap_active_report.md >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Report file not found, check artifacts" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "📥 Download full reports from workflow artifacts" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,91 @@
+name: "DAST - OWASP ZAP Scan"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  zap-scan:
+    name: OWASP ZAP Dynamic Scan
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install Flask dependencies
+      run: |
+        pip install -r requirements.txt
+
+    - name: Start Flask application
+      run: |
+        python app.py &
+        echo $! > flask.pid
+        sleep 5
+        curl -f http://localhost:5000/ || (echo "Flask failed to start" && exit 1)
+
+    - name: ZAP Baseline Scan
+      continue-on-error: true
+      uses: zaproxy/action-baseline@v0.15.0
+      with:
+        target: 'http://127.0.0.1:5000'
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: >
+          -r zap_report.html
+          -J zap_report.json
+          -x zap_report.xml
+          -w zap_report.md
+
+    - name: Stop Flask application
+      if: always()
+      run: |
+        if [ -f flask.pid ]; then
+          kill $(cat flask.pid) || true
+        fi
+
+    - name: List all files for debugging
+      if: always()
+      run: |
+        echo "Current directory contents:"
+        ls -lah
+        echo "Looking for zap reports:"
+        find . -name "*zap*report*" -o -name "report_*" 2>/dev/null || true
+
+    - name: Upload ZAP Reports
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zap-scan-reports
+        path: |
+          zap_report.html
+          zap_report.json
+          zap_report.xml
+          zap_report.md
+          report_html.html
+          report_json.json
+          report_md.md
+        if-no-files-found: warn
+
+    - name: Generate Scan Summary
+      if: always()
+      run: |
+        echo "## 🛡️ OWASP ZAP DAST Scan Complete" >> $GITHUB_STEP_SUMMARY
+        echo "Target: http://127.0.0.1:5000" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ -f zap_report.md ]; then
+          echo "### Scan Results:" >> $GITHUB_STEP_SUMMARY
+          cat zap_report.md >> $GITHUB_STEP_SUMMARY
+        elif [ -f report_md.md ]; then
+          echo "### Scan Results:" >> $GITHUB_STEP_SUMMARY
+          cat report_md.md >> $GITHUB_STEP_SUMMARY
+        else
+          echo "⚠️ Report files not found, check artifacts for details" >> $GITHUB_STEP_SUMMARY
+        fi

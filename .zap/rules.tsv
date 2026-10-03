@@ -1,0 +1,11 @@
+# ZAP Scanning Rules
+# Format: <SCAN_ID>\t<THRESHOLD>\t<ENABLED>
+# IGNORE rules for known issues in this intentionally vulnerable app
+
+# Enable all security scans
+10021	MEDIUM	true	# Cross Site Scripting (Reflected)
+10023	MEDIUM	true	# Information Disclosure
+10024	MEDIUM	true	# SQL Injection
+10025	MEDIUM	true	# Command Injection
+10026	MEDIUM	true	# Path Traversal
+90019	MEDIUM	true	# Server Side Code Injection
